@@ -1,0 +1,63 @@
+# Машина сайта (codexlab-web, единственный внешний адрес): Caddy (HTTPS) и
+# сайт в роли web — страницы, заявки, сайты клиентов. Схему базы не меняет:
+# при старте ждёт, пока её обновит машина админки (до 2 минут).
+#
+# Выкладывает кнопка релиза (release.sh web). Посмотреть на машине:
+#   cd /opt/codexlab/deploy && docker compose -p codexlab -f compose.web.yml \
+#       --env-file ../env/compose.env ps
+#
+# Сеть — машины (network_mode: host): снаружи открыты только 80 и 443 (ufw),
+# сайт слушает 127.0.0.1:8080 и видит Caddy как 127.0.0.1.
+
+name: codexlab
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "5"
+
+services:
+  caddy:
+    # Точная версия и digest, через зеркало Google: Docker Hub режет скачивания без входа (429)
+    image: mirror.gcr.io/library/caddy:2.11.9@sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      SITE_HOSTS: ${SITE_HOSTS:?домены сайта через запятую}
+      ADMIN_UPSTREAM: ${ADMIN_IP:?частный адрес машины админки}:8080
+      # Репетиция — X-Robots-Tag "noindex, nofollow" (поисковики сайт не
+      # берут), боевой адрес — -X-Robots-Tag (заголовка нет); пишет release.sh
+      ROBOTS_HEADER: ${ROBOTS_HEADER:--X-Robots-Tag}
+    volumes:
+      # Папка, а не файл: релиз заменяет Caddyfile, и Caddy видит новый
+      # (release.sh перечитывает его без обрыва соединений)
+      - ./caddy:/etc/caddy:ro
+      # Сертификаты: без тома Caddy выпускал бы их при каждом перезапуске
+      - caddy_data:/data
+      - caddy_config:/config
+    logging: *logging
+
+  web:
+    image: ${IMAGE:-codexlab}:${TAG:?версия образа}
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - ${CODEXLAB_HOME:-/opt/codexlab}/env/app.env
+    environment:
+      ROLE: web
+      HOST: 127.0.0.1
+      PORT: "8080"
+      # База — на машине админки, по частной сети
+      DATABASE_URL: postgresql://codexlab:${POSTGRES_PASSWORD:?пароль базы}@${ADMIN_IP}:5432/codexlab
+      TRUST_PROXY: "1"
+      TRUSTED_PROXIES: ""
+    volumes:
+      - data:/app/data
+    stop_grace_period: 30s
+    logging: *logging
+
+volumes:
+  caddy_data:
+  caddy_config:
+  data:

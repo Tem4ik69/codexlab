@@ -1,4 +1,4 @@
-"""HTTP-часть: сайт, приём заявок, публикация новой версии сайта из админки."""
+"""HTTP-часть: сайт, приём заявок, публикация текстов и цен сайта из админки (они хранятся в базе)."""
 from __future__ import annotations
 
 import base64
@@ -7,13 +7,11 @@ import hmac
 import ipaddress
 import json
 import logging
-import os
 import re
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Awaitable, Callable
 from urllib.parse import unquote
 
@@ -23,6 +21,7 @@ from app.config import Config
 from app.news import NewsStore
 from app.rates import RateService
 from app import seo
+from app.site_content import SiteContent, SiteStore
 from app.storage import Storage
 from app.studio.pipeline import Studio
 from app.studio.store import StudioStore
@@ -33,7 +32,6 @@ log = logging.getLogger("site.web")
 MAX_ORDER_BYTES = 64 * 1024
 MAX_PUBLISH_BYTES = 12 * 1024 * 1024
 MAX_TEXT_CHARS = 20_000
-KEEP_BACKUPS = 20
 BRAND_FILE = re.compile(r"[a-z0-9-]{1,40}\.(png|svg|ico)")    # файлы site/brand, которые сервер отдаёт как есть
 # Файлы подтверждения прав на сайт в корне сайта: Google Search Console, Яндекс Вебмастер, Bing и ключ IndexNow
 VERIFY_FILE = r"(?:google[0-9a-f]{16}\.html|yandex_[0-9a-f]{16}\.html|BingSiteAuth\.xml|[0-9a-f]{32}\.txt)"
@@ -53,7 +51,6 @@ class StudioContext:
     store: StudioStore
     studio: Studio
     news: NewsStore | None
-    sites_dir: Path
     wake_worker: Callable[[], None]
     wake_news: Callable[[], None]
     claude: bool = False
@@ -202,11 +199,18 @@ def _rate_key(address: str) -> str:
     return str(ip)
 
 
-def client_ip(request: web.Request, trust_proxy: bool, cloud_proxy: bool = False) -> str:
+def _from_trusted(address: str | None, trusted: tuple[str, ...]) -> bool:
+    ip = _parse_ip(address or "")
+    return ip is not None and any(ip in ipaddress.ip_network(net, strict=False) for net in trusted
+                                  if ipaddress.ip_network(net, strict=False).version == ip.version)
+
+
+def client_ip(request: web.Request, trust_proxy: bool, cloud_proxy: bool = False, trusted: tuple[str, ...] = ()) -> str:
     """Адрес клиента — ключ для ограничений частоты."""
-    # X-Forwarded-For читаем, только если запрос пришёл от прокси на этой же машине (Caddy или nginx по README).
-    # Иначе, если сервер случайно открыт наружу напрямую, клиент подставил бы любой адрес и обошёл все лимиты.
-    if trust_proxy and _is_loopback(request.remote):
+    # X-Forwarded-For читаем, только если запрос пришёл от своего прокси: на этой же машине (Caddy или nginx по README)
+    # или с машины из TRUSTED_PROXIES (Caddy машины сайта для машины админки). Иначе, если сервер случайно открыт
+    # наружу напрямую, клиент подставил бы любой адрес и обошёл все лимиты.
+    if trust_proxy and (_is_loopback(request.remote) or _from_trusted(request.remote, trusted)):
         forwarded = request.headers.get("X-Forwarded-For", "")
         if forwarded:
             # Берём последний адрес: его дописал наш собственный прокси. Первые значения клиент может подделать.
@@ -240,7 +244,10 @@ def _estimate_text(estimate: object) -> str:
 def create_app(cfg: Config, storage: Storage, on_new_order: Callable[[], None],
                bot_enabled: bool = False, studio: StudioContext | None = None,
                rates: RateService | None = None, on_site_changed: Callable[[], None] = lambda: None,
-               on_admin_action: Callable[[str], None] = lambda text: None) -> web.Application:
+               on_admin_action: Callable[[str], None] = lambda text: None,
+               site: SiteContent | None = None) -> web.Application:
+    # Страница сайта: вёрстка из site/index.html, тексты и цены — последняя публикация из админки в базе.
+    site = site or SiteContent(cfg.index_file, SiteStore(storage.db))
     order_limit = RateLimiter(limit=5, window=600)        # 5 заявок за 10 минут с одного адреса
     order_total = RateLimiter(limit=120, window=3600)     # и не больше 120 в час со всех адресов
     auth_fails = RateLimiter(limit=5, window=900)         # 5 неверных паролей за 15 минут
@@ -262,18 +269,15 @@ def create_app(cfg: Config, storage: Storage, on_new_order: Callable[[], None],
 
     page_cache: dict[object, object] = {}
 
-    def load_page() -> tuple[str, seo.PageMeta, float] | None:
-        """Страница и её настройки для поисковиков. Перечитывается, когда файл изменился (публикация из админки)."""
-        try:
-            stat = cfg.index_file.stat()
-        except OSError:
+    async def load_page() -> tuple[str, seo.PageMeta, float] | None:
+        """Страница и её настройки для поисковиков. Новая — после релиза (файл) или публикации из админки (база)."""
+        live = await site.page()
+        if live is None:
             return None
-        key = (stat.st_mtime_ns, stat.st_size)
-        if page_cache.get("key") != key:
-            text = cfg.index_file.read_text(encoding="utf-8", errors="replace")
+        if page_cache.get("key") != live.key:
             page_cache.clear()
-            page_cache.update(key=key, page=(text, seo.read_meta(text), stat.st_mtime))
-        return page_cache["page"]  # type: ignore[return-value]
+            page_cache.update(key=live.key)
+        return live.text, live.meta, live.modified
 
     def site_base(request: web.Request, meta: seo.PageMeta | None) -> str:
         """Адрес сайта для robots.txt и sitemap.xml: из админки («Адрес сайта»), иначе PUBLIC_URL, иначе адрес запроса."""
@@ -291,7 +295,7 @@ def create_app(cfg: Config, storage: Storage, on_new_order: Callable[[], None],
             raise web.HTTPMovedPermanently(seo.PAGES[name] + (f"?{request.query_string}" if request.query_string else ""))
         lang = request.query.get("lang", "")
         lang = lang if lang in seo.LANGS else seo.LANGS[0]
-        loaded = load_page()
+        loaded = await load_page()
         if loaded is None:
             return web.Response(status=503, text="Сайт ещё не загружен: положите index.html в папку site.")
         page, meta, _ = loaded
@@ -307,12 +311,12 @@ def create_app(cfg: Config, storage: Storage, on_new_order: Callable[[], None],
         return web.Response(body=body, content_type="text/html", charset="utf-8", headers=headers)
 
     async def robots(request: web.Request) -> web.Response:
-        loaded = load_page()
+        loaded = await load_page()
         text = seo.robots_txt(site_base(request, loaded[1] if loaded else None))
         return web.Response(text=text, content_type="text/plain", charset="utf-8", headers={"Cache-Control": "public, max-age=3600"})
 
     async def sitemap(request: web.Request) -> web.Response:
-        loaded = load_page()
+        loaded = await load_page()
         xml = seo.sitemap_xml(site_base(request, loaded[1] if loaded else None), loaded[2] if loaded else None,
                               loaded[1].hidden if loaded else frozenset())
         return web.Response(text=xml, content_type="application/xml", charset="utf-8", headers={"Cache-Control": "public, max-age=3600"})
@@ -334,7 +338,9 @@ def create_app(cfg: Config, storage: Storage, on_new_order: Callable[[], None],
         return web.FileResponse(path, headers={"Cache-Control": "no-cache", "Content-Type": f"{kind}; charset=utf-8"})
 
     async def health(request: web.Request) -> web.Response:
-        data = {"app": "codexlab-site", "ok": True, "publish": cfg.publish_enabled, "bot": bot_enabled}
+        live = await site.page()
+        data = {"app": "codexlab-site", "ok": True, "role": cfg.role, "publish": cfg.publish_enabled, "bot": bot_enabled,
+                "site": live.source if live else "none"}
         if studio is not None:
             data["studio"] = "claude" if studio.claude else "offline"
         return web.json_response(data, headers={"Cache-Control": "no-store"})
@@ -349,7 +355,7 @@ def create_app(cfg: Config, storage: Storage, on_new_order: Callable[[], None],
 
     async def check_admin(request: web.Request) -> web.Response | None:
         """Пароль администратора для служебного API. None — пускаем."""
-        ip = client_ip(request, cfg.trust_proxy, cfg.cloud_proxy)
+        ip = client_ip(request, cfg.trust_proxy, cfg.cloud_proxy, cfg.trusted_proxies)
         if not cfg.publish_enabled:
             return _json_error(403, "Не задан ADMIN_PASSWORD.")
         # Обе проверки — до сравнения пароля: иначе во время блокировки подбор всё равно отличал бы верный пароль
@@ -377,7 +383,7 @@ def create_app(cfg: Config, storage: Storage, on_new_order: Callable[[], None],
         return None
 
     async def order(request: web.Request) -> web.Response:
-        ip = client_ip(request, cfg.trust_proxy, cfg.cloud_proxy)
+        ip = client_ip(request, cfg.trust_proxy, cfg.cloud_proxy, cfg.trusted_proxies)
         if order_limit.blocked(ip) or order_total.blocked("all"):
             return _json_error(429, "Слишком много заявок. Попробуйте позже.")
         if (request.content_length or 0) > MAX_ORDER_BYTES:
@@ -422,7 +428,7 @@ def create_app(cfg: Config, storage: Storage, on_new_order: Callable[[], None],
 
     async def event(request: web.Request) -> web.Response:
         """Счётчик воронки. Хранится только число событий за день: ни адреса, ни устройства не записываются."""
-        ip = client_ip(request, cfg.trust_proxy, cfg.cloud_proxy)
+        ip = client_ip(request, cfg.trust_proxy, cfg.cloud_proxy, cfg.trusted_proxies)
         if event_limit.blocked(ip):
             return _json_error(429, "Слишком много событий.")
         raw = await _read_limited(request, 1024)
@@ -455,54 +461,47 @@ def create_app(cfg: Config, storage: Storage, on_new_order: Callable[[], None],
         if not html.lstrip()[:15].lower().startswith("<!doctype html") or 'id="site-js"' not in html or 'id="site-data"' not in html:
             return _json_error(400, "Это не страница сайта.")
 
-        backup = _write_site(cfg.index_file, raw)
-        ip = client_ip(request, cfg.trust_proxy, cfg.cloud_proxy)
-        previous = backup.name if backup else "нет"
+        try:
+            number, whole = await site.publish(html)
+        except ValueError:
+            return _json_error(400, "В странице нет данных сайта.")
+        ip = client_ip(request, cfg.trust_proxy, cfg.cloud_proxy, cfg.trusted_proxies)
         digest = hashlib.sha256(raw).hexdigest()[:12]
-        log.info("сайт обновлён из админки: адрес %s, %s байт, sha256 %s; прежняя версия: %s", ip, len(raw), digest, previous)
-        on_admin_action(f"🔐 Сайт опубликован из админки\nАдрес: {ip}\nРазмер: {len(raw)} байт, sha256 {digest}\n"
-                        f"Прежняя версия: {previous}\n\nЕсли это были не вы: смените ADMIN_PASSWORD и верните прежнюю версию.")
+        kept = "страница целиком" if whole else "только тексты и цены: админка была открыта на прежней версии сайта"
+        log.info("сайт обновлён из админки: публикация №%s (%s), адрес %s, %s байт, sha256 %s", number, kept, ip, len(raw), digest)
+        on_admin_action(f"🔐 Сайт опубликован из админки\nПубликация №{number}: {kept}\nАдрес: {ip}\n"
+                        f"Размер: {len(raw)} байт, sha256 {digest}\n\nЕсли это были не вы: смените ADMIN_PASSWORD и верните "
+                        f"прежнюю публикацию (python -m app.site_versions).")
         on_site_changed()                     # сообщить поисковикам о новой версии
         return web.json_response({"ok": True})
 
+    # Роль (ROLE): web отвечает только посетителям, admin — только админке и служебному API, all — на всё.
+    # На двух машинах Caddy машины сайта пересылает адреса админки на машину админки (deploy/uzcloud/caddy/Caddyfile);
+    # здесь чужие адреса даже не заведены — промах в Caddy даст 404, а не админку снаружи.
+    public, admin = cfg.role in ("all", "web"), cfg.role in ("all", "admin")
     app = web.Application(middlewares=[headers], client_max_size=MAX_PUBLISH_BYTES + 1024)
-    app.router.add_get("/", index)
-    app.router.add_get("/index.html", index)
-    for path in seo.PAGES.values():          # страницы сайта; «/prices/» ведёт на «/prices»
-        if path != "/":
-            app.router.add_get(path, index)
-            app.router.add_get(path + "/", index)
-    app.router.add_get("/robots.txt", robots)
-    app.router.add_get("/sitemap.xml", sitemap)
-    app.router.add_get("/{name:" + VERIFY_FILE + "}", verify_file)
-    app.router.add_get("/brand/{name}", brand)
-    app.router.add_get("/favicon.ico", brand)
     app.router.add_get("/api/health", health)
-    app.router.add_get("/api/rate", rate)
-    app.router.add_post("/api/order", order)
-    app.router.add_post("/api/event", event)
-    app.router.add_post("/api/publish", publish)
+    if public:
+        app.router.add_get("/", index)
+        app.router.add_get("/index.html", index)
+        for path in seo.PAGES.values():          # страницы сайта; «/prices/» ведёт на «/prices»
+            if path != "/":
+                app.router.add_get(path, index)
+                app.router.add_get(path + "/", index)
+        app.router.add_get("/robots.txt", robots)
+        app.router.add_get("/sitemap.xml", sitemap)
+        app.router.add_get("/{name:" + VERIFY_FILE + "}", verify_file)
+        app.router.add_get("/brand/{name}", brand)
+        app.router.add_get("/favicon.ico", brand)
+        app.router.add_get("/api/rate", rate)
+        app.router.add_post("/api/order", order)
+        app.router.add_post("/api/event", event)
+    if admin:
+        app.router.add_post("/api/publish", publish)
     if studio is not None:
-        setup_studio(app, store=studio.store, studio=studio.studio, news=studio.news, sites_dir=studio.sites_dir,
-                     check_admin=check_admin, client_ip=lambda request: client_ip(request, cfg.trust_proxy, cfg.cloud_proxy),
+        setup_studio(app, store=studio.store, studio=studio.studio, news=studio.news,
+                     check_admin=check_admin, client_ip=lambda request: client_ip(request, cfg.trust_proxy, cfg.cloud_proxy, cfg.trusted_proxies),
                      limiter=lambda limit, window: RateLimiter(limit, window), wake_worker=studio.wake_worker,
-                     wake_news=studio.wake_news, on_admin_action=on_admin_action)
+                     wake_news=studio.wake_news, on_admin_action=on_admin_action, public=public, admin=admin)
     return app
 
-
-def _write_site(index_file: Path, content: bytes) -> Path | None:
-    """Сохраняет прежнюю версию в backups и подменяет файл целиком: посетитель не увидит полузаписанную страницу."""
-    index_file.parent.mkdir(parents=True, exist_ok=True)
-    backups = index_file.parent / "backups"
-    backup: Path | None = None
-    if index_file.is_file():
-        backups.mkdir(exist_ok=True)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
-        backup = backups / f"index-{stamp}.html"
-        backup.write_bytes(index_file.read_bytes())
-        for old in sorted(backups.glob("index-*.html"))[:-KEEP_BACKUPS]:
-            old.unlink(missing_ok=True)
-    temp = index_file.with_suffix(".html.tmp")
-    temp.write_bytes(content)
-    os.replace(temp, index_file)
-    return backup
