@@ -4,6 +4,8 @@
 # Только по кнопке: Actions → release → Run workflow, ветка — та, что
 # выкладывается (до переезда — uzcloud, после — main). Выкладывается
 # последний коммит ветки, и только если на нём прошли автотесты (tests).
+# Жать могут только логины из переменной RELEASE_ACTORS (через запятую), и
+# только из ветки RELEASE_BRANCH (по умолчанию main; до переезда — uzcloud).
 #
 # Что делает:
 # - «подготовить машины» — deploy/uzcloud/bootstrap.sh на обеих машинах
@@ -71,7 +73,26 @@ jobs:
       BOOTSTRAP_USER: ${{ vars.PROD_BOOTSTRAP_USER || 'root' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Кто и откуда выкладывает
+        env:
+          ACTOR: ${{ github.actor }}
+          ALLOWED: ${{ vars.RELEASE_ACTORS }}
+          BRANCH: ${{ vars.RELEASE_BRANCH || 'main' }}
+        run: |
+          set -euo pipefail
+          # Право записи в репозиторий — ещё не право выкладывать на боевые машины
+          actor=$(printf '%s' "$ACTOR" | tr '[:upper:]' '[:lower:]')
+          allowed=$(printf '%s' "$ALLOWED" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+          case ",$allowed," in
+            *",$actor,"*) echo "Релиз запустил $ACTOR" ;;
+            *) echo "::error::$ACTOR нет в переменной RELEASE_ACTORS — релиз жмут только те, кто в ней"; exit 1 ;;
+          esac
+          if [ "$GITHUB_REF" != "refs/heads/$BRANCH" ]; then
+            echo "::error::Релиз — только из ветки $BRANCH (переменная RELEASE_BRANCH), а запущен из $GITHUB_REF"
+            exit 1
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Вся история ветки: что вошло с прошлого релиза
           fetch-depth: 0
@@ -266,6 +287,8 @@ jobs:
           S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
           S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
           BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+          HC_PING_DB: ${{ secrets.HC_PING_DB }}
+          HC_PING_CHECK: ${{ secrets.HC_PING_CHECK }}
         run: |
           set -euo pipefail
           # Строка KEY=значение; пустое — не пишем (у сайта своё значение по
@@ -323,10 +346,16 @@ jobs:
               printf 'S3_ACCESS_KEY=%q\n' "$S3_ACCESS_KEY"
               printf 'S3_SECRET_KEY=%q\n' "$S3_SECRET_KEY"
               printf 'BACKUP_PASSPHRASE=%q\n' "$BACKUP_PASSPHRASE"
+              # Адреса сигналов Healthchecks — тоже секреты: по ним любой отметит копию снятой
+              if [ -n "$HC_PING_DB" ]; then printf 'HC_PING_DB=%q\n' "$HC_PING_DB"; fi
+              if [ -n "$HC_PING_CHECK" ]; then printf 'HC_PING_CHECK=%q\n' "$HC_PING_CHECK"; fi
             } | ssh admin 'umask 077; cat > /opt/codexlab/env/backup.env'
           else
             ssh admin 'rm -f /opt/codexlab/env/backup.env'
             echo "::warning::Нет ключей хранилища (S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY) или BACKUP_PASSPHRASE — копии базы не снимаются."
+          fi
+          if [ -z "$HC_PING_DB" ] || [ -z "$HC_PING_CHECK" ]; then
+            echo "::warning::Нет секретов HC_PING_DB или HC_PING_CHECK — о сбое копии или проверки восстановления никто не узнает."
           fi
 
       - name: Копия базы перед релизом

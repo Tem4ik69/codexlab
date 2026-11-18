@@ -19,7 +19,8 @@ x-logging: &logging
 
 services:
   caddy:
-    image: caddy:2
+    # Точная версия и digest, через зеркало Google: Docker Hub режет скачивания без входа (429)
+    image: mirror.gcr.io/library/caddy:2.11.9@sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b
     restart: unless-stopped
     network_mode: host
     environment:

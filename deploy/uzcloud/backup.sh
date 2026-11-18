@@ -24,16 +24,24 @@
 #
 # Итог — строкой в журнал (/opt/codexlab/backup/backup.log) и кодом выхода;
 # сбой начинается со слова ОШИБКА. Без данных из базы: только размеры,
-# число таблиц и доли строк. Сигналы о копиях (Healthchecks и т. п.)
-# подключает мониторинг.
+# число таблиц и доли строк.
+#
+# Сигналы в Healthchecks.io — HC_PING_DB (ночная копия базы) и HC_PING_CHECK
+# (проверка восстановления), адреса — в backup.env из секретов GitHub (в коде и
+# журнале их нет). Начало — /start, итог — строка журнала, сбой — /fail с
+# причиной. Не пришёл сигнал вовремя (машина выключена, cron не сработал) —
+# тревогу поднимает сам Healthchecks. Копия перед релизом (с меткой) сигналов
+# не шлёт: её итог виден в самом релизе. Пустые адреса — без сигналов.
 set -euo pipefail
 
 APP_HOME=${CODEXLAB_HOME:-/opt/codexlab}
 DEPLOY=$APP_HOME/deploy
 ENV_DIR=$APP_HOME/env
 WORK=$APP_HOME/backup
-RCLONE_IMAGE=rclone/rclone:1.68
-PG_IMAGE=postgres:18
+# Точные версии и digest, через зеркало Google (Docker Hub режет скачивания без входа);
+# PG_IMAGE — тот же, что у базы в compose.admin.yml: копия поднимается той же версией
+RCLONE_IMAGE=mirror.gcr.io/rclone/rclone:1.68.2@sha256:74c51b8817e5431bd6d7ed27cb2a50d8ee78d77f6807b72a41ef6f898845942b
+PG_IMAGE=mirror.gcr.io/library/postgres:18.7@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc
 KEEP_DAYS=90
 MIN_TABLES=14            # таблиц в схеме codexlab (app/db.py) — меньше: копия неполная
 
@@ -53,6 +61,19 @@ fi
 : "${S3_ENDPOINT:?}" "${S3_BUCKET:?}" "${S3_ACCESS_KEY:?}" "${S3_SECRET_KEY:?}" "${BACKUP_PASSPHRASE:?}"
 prefix=${BACKUP_PREFIX:-codexlab}
 
+hc_url=""
+case "$what" in
+    db) if [ -z "$label" ]; then hc_url=${HC_PING_DB:-}; fi ;;
+    check) hc_url=${HC_PING_CHECK:-} ;;
+esac
+hc_sent=0
+# hc_ping <"" | /start | /fail> [текст] — сбой связи с Healthchecks копию не останавливает
+hc_ping() {
+    if [ -z "$hc_url" ]; then return 0; fi
+    curl -fsS -m 10 --retry 3 -o /dev/null --data-raw "${2:-}" "$hc_url$1" 2> /dev/null || true
+}
+hc_ping /start
+
 compose=(docker compose -p codexlab -f "$DEPLOY/compose.admin.yml" --env-file "$ENV_DIR/compose.env")
 live() { "${compose[@]}" exec -T db psql -U codexlab -d codexlab -Atqc "$1"; }
 
@@ -61,6 +82,11 @@ plain=""
 check_dir=""
 check_box=""
 finish() {
+    local rc=$?
+    # Упало не через fail (set -e: pg_dump, gpg, docker…) — Healthchecks всё равно узнает о сбое
+    if [ "$rc" -ne 0 ] && [ "$hc_sent" = 0 ]; then
+        hc_ping /fail "ОШИБКА: $what прервался с кодом $rc — подробности в /opt/codexlab/backup/backup.log"
+    fi
     if [ -n "$plain" ]; then rm -f "$plain"; fi
     if [ -n "$check_box" ]; then docker rm -f "$check_box" > /dev/null 2>&1 || true; fi
     if [ -n "$check_dir" ]; then rm -rf "$check_dir"; fi
@@ -89,7 +115,16 @@ rclone() {
 
 fail() {
     echo "$(date -Iseconds) ОШИБКА${2:+ $2}: $1" >&2
+    hc_sent=1
+    hc_ping /fail "ОШИБКА${2:+ $2}: $1"
     exit 1
+}
+
+# Итог — в журнал и в Healthchecks
+done_ok() {
+    echo "$1"
+    hc_sent=1
+    hc_ping "" "$1"
 }
 
 umask 077
@@ -125,7 +160,7 @@ case "$what" in
             || echo "$(date -Iseconds) ВНИМАНИЕ: старые копии старше $KEEP_DAYS дней не удалились" >&2
         # На машине — три последние ночи: быстрое восстановление без хранилища
         find "$WORK" -maxdepth 1 -name 'codexlab-*.dump.gpg' -mtime +3 -delete
-        echo "$(date -Iseconds) Копия базы: $prefix/db/$file, $((size / 1024)) КБ, таблиц $tables"
+        done_ok "$(date -Iseconds) Копия базы: $prefix/db/$file, $((size / 1024)) КБ, таблиц $tables"
         ;;
     check)
         # Копия, из которой ни разу не поднимались, — ещё не копия. Здесь —
@@ -216,7 +251,7 @@ case "$what" in
             shares="${shares:+$shares, }$table $share%"
         done
 
-        echo "$(date -Iseconds) Проверка восстановления: копия $name ($((size / 1024)) КБ, снята $age ч назад) поднимается: таблиц $tables, схема — шаг $steps; $shares от боевой; $(( $(date +%s) - started )) с"
+        done_ok "$(date -Iseconds) Проверка восстановления: копия $name ($((size / 1024)) КБ, снята $age ч назад) поднимается: таблиц $tables, схема — шаг $steps; $shares от боевой; $(( $(date +%s) - started )) с"
         ;;
     *)
         echo "Что делать: db или check" >&2
