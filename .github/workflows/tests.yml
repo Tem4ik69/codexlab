@@ -21,7 +21,8 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:18                   # та же версия, что на машине админки (deploy/uzcloud)
+        # та же версия, что на машине админки (deploy/uzcloud/compose.admin.yml)
+        image: mirror.gcr.io/library/postgres:18.7@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc
         env:
           POSTGRES_USER: codexlab
           POSTGRES_PASSWORD: codexlab        # только для этой временной базы проверок
@@ -36,8 +37,9 @@ jobs:
     env:
       TEST_DATABASE_URL: postgresql://codexlab:codexlab@localhost:5432/codexlab_test
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # Действия — по SHA коммита: тег можно передвинуть на чужой код
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version-file: .python-version
           cache: pip

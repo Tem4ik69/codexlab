@@ -21,7 +21,9 @@ x-logging: &logging
 
 services:
   db:
-    image: postgres:18
+    # Точная версия и digest, через зеркало Google: Docker Hub режет скачивания без входа (429),
+    # а плавающий тег привёз бы на машину не ту версию. Обновлять — вместе с PG_IMAGE в backup.sh
+    image: mirror.gcr.io/library/postgres:18.7@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc
     restart: unless-stopped
     network_mode: host
     environment:
