@@ -81,10 +81,10 @@ jobs:
         run: |
           set -euo pipefail
           # Право записи в репозиторий — ещё не право выкладывать на боевые машины
-          actor=$(printf '%s' "$ACTOR" | tr '[:upper:]' '[:lower:]')
-          allowed=$(printf '%s' "$ALLOWED" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
-          case ",$allowed," in
-            *",$actor,"*) echo "Релиз запустил $ACTOR" ;;
+          login=$(printf '%s' "$ACTOR" | tr '[:upper:]' '[:lower:]')
+          logins=$(printf '%s' "$ALLOWED" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+          case ",$logins," in
+            *",$login,"*) echo "Релиз запустил $ACTOR" ;;
             *) echo "::error::$ACTOR нет в переменной RELEASE_ACTORS — релиз жмут только те, кто в ней"; exit 1 ;;
           esac
           if [ "$GITHUB_REF" != "refs/heads/$BRANCH" ]; then
